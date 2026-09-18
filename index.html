@@ -87,6 +87,7 @@
     <h2>2. 自動分割の設定</h2>
     <label class="opt"><input type="checkbox" id="splitHeading" checked> 見出し記号で分割 (■◆●▼章 など)</label>
     <label class="opt"><input type="checkbox" id="splitBlank" checked> 空行で分割</label>
+    <label class="opt"><input type="checkbox" id="joinLines" checked> 文の途中の改行を詰める（。まで1行に）</label>
     <label class="opt"><input type="checkbox" id="splitPage"> ページの切れ目で必ず分割</label>
     <div style="margin:8px 0 4px">追加の見出しパターン (正規表現)</div>
     <input type="text" id="customPattern" placeholder="例: ^(導入|探索|クライマックス)">
@@ -238,7 +239,7 @@ async function onFile(file) {
     if (/\.txt$/i.test(file.name) || file.type === 'text/plain') {
       const text = await readTextFile(file);
       state.name = file.name;
-      state.pages = [{ page: 1, text }];
+      state.pages = [{ page: 1, text, fromTxt: true }];
       state.blocks = autoSplit(state.pages);
       state.projectId = genId();
       resetUndo();
@@ -322,10 +323,47 @@ function layoutText(items, pageWidth) {
 // ---------------------------------------------------------------- 自動分割
 const HEADING = /^[\s　]*([■◆●▼◎★☆〇◇□]|【[^】]{1,30}】|[第]?[0-9０-９一二三四五六七八九十]{1,3}[章節話幕]|(シーン|SCENE|Scene)[\s　]*[0-9０-９]+)/;
 
+// PDFの「文の途中で改行」を詰める。空行(段落区切り)と見出しは残し、
+// 。！？などの文末が来るまで行を連結する。
+function reflowLines(text, custom, useHeading) {
+  const isHead = line => (useHeading && HEADING.test(line)) || (custom && custom.test(line.trim()));
+  const out = [];
+  let buf = '';
+  // つないだ文を文末(。！？…)の直後で改行し直す。ただしかぎ括弧「」『』の中の
+  // 。では改行しない(セリフを分断しない)。文末直後の閉じ括弧はまとめて取り込む。
+  const flush = () => {
+    if (!buf) return;
+    const TERM = '。！？!?…‥', CLOSER = '」』）)】〕';
+    let depth = 0, cur = '';
+    for (let i = 0; i < buf.length; i++) {
+      const ch = buf[i];
+      cur += ch;
+      if (ch === '「' || ch === '『') depth++;
+      else if ((ch === '」' || ch === '』') && depth > 0) depth--;
+      else if (depth === 0 && TERM.includes(ch)) {
+        while (i + 1 < buf.length && CLOSER.includes(buf[i + 1])) cur += buf[++i];
+        if (cur.trim()) out.push(cur);
+        cur = '';
+      }
+    }
+    if (cur.trim()) out.push(cur);
+    buf = '';
+  };
+  for (const raw of text.split('\n')) {
+    const line = raw.replace(/\s+$/, '');
+    if (!line.trim()) { flush(); out.push(''); continue; }   // 空行=段落の区切り
+    if (isHead(line)) { flush(); out.push(line); continue; } // 見出しは独立させる
+    buf += buf ? line.replace(/^[\s　]+/, '') : line;         // 行頭インデントを詰めて連結
+  }
+  flush();
+  return out.join('\n');
+}
+
 function autoSplit(pages) {
   const useHeading = $('splitHeading').checked;
   const useBlank = $('splitBlank').checked;
   const perPage = $('splitPage').checked;
+  const joinLines = $('joinLines').checked;
   let custom = null;
   const cp = $('customPattern').value.trim();
   if (cp) { try { custom = new RegExp(cp); } catch (e) { alert('正規表現が不正です: ' + e.message); } }
@@ -340,7 +378,9 @@ function autoSplit(pages) {
 
   pages.forEach((p, pi) => {
     if (perPage && pi > 0) { push(); cur.title = `p.${p.page}`; }
-    const lines = p.text.split('\n');
+    // テキストファイル(改行が意図的)以外は、文途中の改行詰めを適用
+    const pageText = (joinLines && !p.fromTxt) ? reflowLines(p.text, custom, useHeading) : p.text;
+    const lines = pageText.split('\n');
     let blankRun = 0;
     for (const raw of lines) {
       const line = raw.replace(/\s+$/, '');
