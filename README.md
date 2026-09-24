@@ -4,6 +4,8 @@ TRPGシナリオのPDF・テキストファイルを読み込み、文章を自�
 
 **ツールを開く 👉 https://kanokanochan.github.io/scenario-to-ccfolia/**
 
+**使い方ガイド（PDF・画面付き） 👉 https://kanokanochan.github.io/scenario-to-ccfolia/guide.pdf**
+
 ## 特徴
 
 - インストール不要。リンクを開くだけ（Mac / Windows / iPad / スマホ）。
