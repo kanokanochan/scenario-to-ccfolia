@@ -258,6 +258,7 @@ async function onFile(file) {
       data: buf, cMapUrl: 'inline://', cMapPacked: true, CMapReaderFactory: InlineCMapReaderFactory,
     }).promise;
     const pages = [];
+    layoutText.lost = 0;
     for (let i = 1; i <= pdf.numPages; i++) {
       $('loadingMsg').textContent = `PDFを解析しています… (${i}/${pdf.numPages}ページ)`;
       const page = await pdf.getPage(i);
@@ -269,6 +270,12 @@ async function onFile(file) {
     if (totalChars < 40) {
       alert('このPDFには文字が埋め込まれていないようです(スキャン画像のPDF)。\nこのツールは文字が選択できるPDF専用です。');
       return;
+    }
+    if (layoutText.lost > 0) {
+      alert(`このPDFには、ブラウザ版では読み取れない文字が ${layoutText.lost} か所ありました。\n` +
+            `その箇所は「〓」で表示しています。前後の文脈から判断して手で直してください。\n` +
+            `(Wordで作られたPDFで起きることがある現象です。同じ文字が繰り返し欠けるので、\n` +
+            `「単語の置き換え」で 〓 → 正しい文字 を登録すると一括で直せます)`);
     }
     state.name = file.name;
     state.pages = pages;
@@ -289,13 +296,34 @@ async function onFile(file) {
 // 列(段組・欄外メモ)を横位置から自動検出し、左の列→右の列の順、列内は上→下で読む。
 // x範囲が重なる断片を同じ列とみなす(中央固定で分けない)。細い列は【欄外メモ】として分離。
 function layoutText(items, pageWidth) {
-  items = items.filter(it => it.str && it.str.trim());
-  if (!items.length) return "";
+  // 空白item の扱い: 幅が1文字分ある半角スペース = pdf.js が読めなかった文字(Word製PDFで起きる)→「〓」で可視化。
+  // それ以外の空白は本物のスペースとして残す(「HO1 と」の空白を落とさない)。
+  let lost = 0;
+  items = items.filter(it => it && typeof it.str === 'string' && it.str.length).map(it => {
+    if (it.str.trim()) return it;
+    return { ...it, _space: true };
+  });
+  // 同じ行の隣の文字の高さを基準に、「全角1文字分ちょうどの幅を持つ半角スペース」を欠落文字とみなす
+  // (pdf.jsはこの欠落 item の height を 0 で返すことがあるので、自身の height は当てにしない)
+  for (let k = 0; k < items.length; k++) {
+    const it = items[k];
+    if (!it._space || it.str !== ' ') continue;
+    const y = it.transform[5];
+    let refH = 0;
+    for (const d of [1, -1, 2, -2]) {
+      const nb = items[k + d];
+      if (nb && !nb._space && nb.height > 0 && Math.abs(nb.transform[5] - y) < 2) { refH = nb.height; break; }
+    }
+    if (refH && it.width > refH * 0.85 && it.width < refH * 1.15) { lost++; items[k] = { ...it, str: '〓', _space: false, _lost: true }; }
+  }
+  layoutText.lost = (layoutText.lost || 0) + lost;
+  const solid = items.filter(it => !it._space);
+  if (!solid.length) return "";
   const x0of = it => it.transform[4], x1of = it => it.transform[4] + it.width;
   // 列の x 区間: 幅が広すぎる断片(列をまたぐ帯見出し等)は区間作りから外す
-  const narrow = items.filter(it => it.width <= pageWidth * 0.6);
+  const narrow = solid.filter(it => it.width <= pageWidth * 0.6);
   const cols = [];
-  for (const [x0, x1] of (narrow.length ? narrow : items).map(it => [x0of(it), x1of(it)]).sort((a, b) => a[0] - b[0])) {
+  for (const [x0, x1] of (narrow.length ? narrow : solid).map(it => [x0of(it), x1of(it)]).sort((a, b) => a[0] - b[0])) {
     if (cols.length && x0 <= cols[cols.length - 1][1] + 2) cols[cols.length - 1][1] = Math.max(cols[cols.length - 1][1], x1);
     else cols.push([x0, x1]);
   }
@@ -319,10 +347,13 @@ function layoutText(items, pageWidth) {
     let line = [], lastY = null, lastH = 10, lastShort = false;
     const flush = () => {
       if (!line.length) return;
+      const solidLine = line.filter(it => !it._space);
+      if (!solidLine.length) { line = []; return; }   // 空白だけの行は捨てる
       let s = '';
       for (let k = 0; k < line.length; k++) {
         const it = line[k];
-        if (k > 0) {
+        if (it._space) { if (s && !s.endsWith(' ')) s += ' '; continue; }
+        if (k > 0 && !line[k - 1]._space) {
           const prev = line[k - 1];
           const gap = x0of(it) - x1of(prev);
           if (gap > (it.height || 10) * 0.25 && /[A-Za-z0-9]$/.test(prev.str) && /^[A-Za-z0-9]/.test(it.str)) s += ' ';
@@ -330,7 +361,7 @@ function layoutText(items, pageWidth) {
         s += it.str;
       }
       s = s.replace(/\s+$/, '');
-      const lw = Math.max(...line.map(x1of)) - Math.min(...line.map(x0of));
+      const lw = Math.max(...solidLine.map(x1of)) - Math.min(...solidLine.map(x0of));
       line = [];
       if (PAGE_NUM.test(s)) return;
       out.push(s);
@@ -358,7 +389,7 @@ function layoutText(items, pageWidth) {
 }
 
 // ---------------------------------------------------------------- 自動分割
-const HEADING = /^[\s　]*([■◆●▼▽△▲◎★☆〇◇□]|【[^】]{1,30}】|[第]?[0-9０-９一二三四五六七八九十]{1,3}[章節話幕]|(シーン|SCENE|Scene)[\s　]*[0-9０-９]+)/;
+const HEADING = /^[\s　]*([■◆●▼▽△▲◾◽◎★☆〇◇□]|【[^】]{1,30}】|[第]?[0-9０-９一二三四五六七八九十]{1,3}[章節話幕]|(シーン|SCENE|Scene)[\s　]*[0-9０-９]+)/;
 
 // PDFの「文の途中で改行」を詰める。空行(段落区切り)と見出しは残し、
 // 。！？などの文末が来るまで行を連結する。
@@ -446,7 +477,7 @@ function withMark(t) {
   t = (t || '').trim();
   const mark = ($('titleMark') ? $('titleMark').value : '■').trim();
   if (!t || !mark) return t;
-  if (t.startsWith(mark) || /^[■◆●▼▽△▲◎★☆〇◇□【《〈]/.test(t)) return t;
+  if (t.startsWith(mark) || /^[■◆●▼▽△▲◾◽◎★☆〇◇□【《〈]/.test(t)) return t;
   return mark + t;
 }
 // 本文から「記号＋代表的な短いタイトル」を自動生成(文頭の句読点・括弧までを最大15字)
