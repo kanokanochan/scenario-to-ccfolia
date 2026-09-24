@@ -106,6 +106,12 @@
     </div>
     <button onclick="splitLong()" style="width:100%">長いブロックを指定文字数で分割</button>
     <button onclick="dedupeTitles()" style="width:100%; margin-top:6px">本文先頭のタイトル重複を削除</button>
+    <div style="display:flex; gap:6px; align-items:center; margin-top:12px">
+      <span style="white-space:nowrap">タイトル記号</span>
+      <input type="text" id="titleMark" value="■" style="width:70px" oninput="saveTitleMark()">
+    </div>
+    <button onclick="applyTitleMark()" style="width:100%; margin-top:6px">全ブロックのタイトルに記号を付ける</button>
+    <div class="hint">自動で付くタイトルは「記号＋文頭の代表句(15字まで)」になります。例: ■探索者たちは旧山荘に招かれた</div>
     <div style="margin-top:14px; display:flex; flex-direction:column; gap:6px">
       <button onclick="saveProject()">💾 作業内容をファイルに保存</button>
       <button onclick="document.getElementById('loadFile').click()">📂 保存した作業を開く</button>
@@ -119,7 +125,7 @@
     <h2>使い方</h2>
     <div class="hint">
       ① PDFを読み込む → 自動でブロックに分かれます<br>
-      ② カードの枠クリックで選択→「結合」、本文にカーソルを置いて「✂分割」、🔗↑🔗↓で隣と結合、ドラッグで並べ替え<br>
+      ② カードの枠クリックで選択→「結合」、本文の分割したい位置をクリックして ⌘/Ctrl+Enter(または✂分割)、🔗↑🔗↓で隣と結合、ドラッグで並べ替え<br>
       ③ 右上のzip書き出し → ココフォリアの部屋画面にzipをドラッグ&ドロップ<br>
       ④ シナリオテキスト一覧に一括登録されます(既存の部屋データには影響しません)
     </div>
@@ -372,7 +378,7 @@ function autoSplit(pages) {
   let cur = { title: '', lines: [] };
   const push = () => {
     const text = cur.lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
-    if (text) chunks.push({ title: cur.title || firstLine(text), text });
+    if (text) chunks.push({ title: withMark(cur.title) || autoTitle(text), text });
     cur = { title: '', lines: [] };
   };
 
@@ -404,14 +410,29 @@ function autoSplit(pages) {
 
 const firstLine = t => (t.split('\n').find(l => l.trim()) || 'テキスト').trim().slice(0, 30);
 
+// タイトル記号(■など)を先頭に付ける。すでに記号で始まっていれば付けない
+function withMark(t) {
+  t = (t || '').trim();
+  const mark = ($('titleMark') ? $('titleMark').value : '■').trim();
+  if (!t || !mark) return t;
+  if (t.startsWith(mark) || /^[■◆●▼◎★☆〇◇□【《〈]/.test(t)) return t;
+  return mark + t;
+}
+// 本文から「記号＋代表的な短いタイトル」を自動生成(文頭の句読点・括弧までを最大15字)
+function autoTitle(text) {
+  const line = (text.split('\n').find(l => l.trim()) || 'テキスト').trim();
+  const t = line.split(/[。、！？!?「」『』（）()：:　]/)[0].trim() || line;
+  return withMark(t.slice(0, 15));
+}
+
 function chunkFromText(text) {
   const lines = text.split('\n');
   const idx = lines.findIndex(l => l.trim());
   if (idx >= 0 && HEADING.test(lines[idx])) {
     const body = lines.slice(idx + 1).join('\n').trim();
-    if (body) return { title: lines[idx].trim().slice(0, 40), text: body, sel: false };
+    if (body) return { title: withMark(lines[idx].trim().slice(0, 40)), text: body, sel: false };
   }
-  return { title: firstLine(text), text, sel: false };
+  return { title: autoTitle(text), text, sel: false };
 }
 
 function resplit() {
@@ -440,7 +461,7 @@ function render() {
         <span class="chars">${b.text.length}字</span>
         <button title="上のブロックと結合" onclick="mergeWith(${i},-1)">🔗↑</button>
         <button title="下のブロックと結合" onclick="mergeWith(${i},1)">🔗↓</button>
-        <button title="カーソル位置で2つに分割" onmousedown="event.preventDefault()" onclick="splitAtCursor(${i})">✂ 分割</button>
+        <button title="カーソル位置で2つに分割（本文内で ⌘/Ctrl+Enter でも分割できます）" onmousedown="event.preventDefault()" onclick="splitAtCursor(${i})">✂ 分割</button>
         <button title="上へ移動" onclick="move(${i},-1)">↑</button>
         <button title="下へ移動" onclick="move(${i},1)">↓</button>
         <button class="danger" onclick="removeBlock(${i})">✕</button>
@@ -451,6 +472,19 @@ function render() {
     list.appendChild(card);
     const ta = card.querySelector('textarea');
     autoGrow(ta);
+    // 本文内で ⌘/Ctrl+Enter → その位置で分割し、できた次のブロックへカーソルを移す
+    ta.addEventListener('keydown', e => {
+      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        b._caret = ta.selectionStart;
+        const n = state.blocks.length;
+        splitAtCursor(i);
+        if (state.blocks.length > n) {
+          const next = document.querySelectorAll('#list textarea')[i + 1];
+          if (next) { next.focus(); next.setSelectionRange(0, 0); }
+        }
+      }
+    });
     // テキスト/タイトルの編集は「編集を始める前」の状態を1回だけ戻る用に記録
     [ta, card.querySelector('input.title')].forEach(inp => {
       inp.addEventListener('focus', () => { editSnap = snapshot(); editSnapPushed = false; });
@@ -526,7 +560,7 @@ function splitAtCursor(i) {
   const b = state.blocks[i];
   const pos = b._caret;
   if (pos == null || pos <= 0 || pos >= b.text.length) {
-    alert('本文内の分割したい位置をクリックしてから「✂ 分割」を押してください');
+    toast('本文の分割したい位置をクリックしてから ⌘/Ctrl+Enter か「✂ 分割」');
     return;
   }
   const before = b.text.slice(0, pos).trimEnd();
@@ -552,6 +586,19 @@ function mergeWith(i, d) {
   state.blocks.splice(a, 2, merged);
   render(); persist();
 }
+
+// 全ブロックのタイトルに記号を付ける(すでに付いているものはそのまま)
+function applyTitleMark() {
+  if (!state.blocks.length) { alert('ブロックがありません'); return; }
+  const after = state.blocks.map(b => withMark(b.title));
+  const n = after.filter((t, k) => t !== (state.blocks[k].title || '').trim()).length;
+  if (!n) { toast('すべてのタイトルに記号が付いています'); return; }
+  pushUndo();
+  state.blocks.forEach((b, k) => b.title = after[k]);
+  render(); persist();
+  toast(`${n}個のタイトルに記号を付けました`);
+}
+function saveTitleMark() { try { localStorage.setItem('c2c-titleMark', $('titleMark').value); } catch (e) {} }
 
 function dedupeTitles() {
   const snap = snapshot();
@@ -980,6 +1027,7 @@ try {
     render();
   }
 } catch (e) {}
+try { const m = localStorage.getItem('c2c-titleMark'); if (m !== null) $('titleMark').value = m; } catch (e) {}
 render();
 renderRules();
 refreshHistory();
