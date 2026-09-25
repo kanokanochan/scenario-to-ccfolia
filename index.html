@@ -3585,6 +3585,7 @@ async function onFile(file) {
         st.destroy(); page.destroy();
       }
     } finally { doc.destroy(); }
+    stripRunningLines(pages);
     const totalChars = pages.reduce((s, p) => s + p.text.trim().length, 0);
     if (totalChars < 40) {
       alert('このPDFには文字が埋め込まれていないようです(スキャン画像のPDF)。\nこのツールは文字が選択できるPDF専用です。');
@@ -3607,6 +3608,27 @@ async function onFile(file) {
 
 // 列(段組・欄外メモ)を横位置から自動検出し、左の列→右の列の順、列内は上→下で読む。
 // (ローカル版 server.py の extract_page_text と同じロジック。入力は座標付きの行)
+// 全ページの6割以上に同じ短い行があれば柱(ヘッダー/フッター)とみなして除去する
+function stripRunningLines(pages) {
+  const n = pages.length;
+  if (n < 4) return;
+  const cnt = new Map();
+  for (const p of pages) {
+    const seen = new Set(p.text.split('\n').map(x => x.trim()).filter(x => x && x.length <= 60));
+    for (const ln of seen) cnt.set(ln, (cnt.get(ln) || 0) + 1);
+  }
+  const repeated = new Set([...cnt].filter(([t, c]) => c >= Math.max(3, n * 0.6)).map(([t]) => t));
+  if (!repeated.size) return;
+  for (const p of pages) {
+    const out = [];
+    for (const x of p.text.split('\n')) {
+      if (repeated.has(x.trim())) continue;
+      if (!x.trim() && out.length && !out[out.length - 1].trim()) continue;
+      out.push(x);
+    }
+    p.text = out.join('\n').trim();
+  }
+}
 const PAGE_NUM_RE = /^[\s\-‐－–—―]*\d+[\s\-‐－–—―]*$/;        // 「- 5 -」などのページ番号行
 const SENT_END_RE = /[。！？!?…‥、][」』）)】〕]*$/;             // 文末/読点で終わる(=折り返し途中ではない)
 function layoutFromLines(rawLines, pageWidth) {
@@ -3614,25 +3636,72 @@ function layoutFromLines(rawLines, pageWidth) {
     .map(l => ({ ...l, text: (l.text || '').replace(/\s+$/, '') }))
     .filter(l => l.text.trim() && !PAGE_NUM_RE.test(l.text) && isFinite(l.x0) && isFinite(l.y0));
   if (!lines.length) return '';
-  // 列の x 区間: 幅が広すぎる行(列をまたぐ帯見出し等)は区間作りから外す
+  // 列の検出: 各 x 位置を「何行が覆っているか」を数え、ほとんどの行が通らない隙間を列の境界とする。
+  // (x範囲の連結だと、中央見出しや柱のように隙間をまたぐ1行で左右の列がつながってしまう)
   const narrow = lines.filter(l => (l.x1 - l.x0) <= pageWidth * 0.6);
-  const cols = [];
-  for (const [x0, x1] of (narrow.length ? narrow : lines).map(l => [l.x0, l.x1]).sort((a, b) => a[0] - b[0])) {
-    if (cols.length && x0 <= cols[cols.length - 1][1] + 2) cols[cols.length - 1][1] = Math.max(cols[cols.length - 1][1], x1);
-    else cols.push([x0, x1]);
+  const cover = new Array(Math.floor(pageWidth) + 2).fill(0);
+  for (const l of (narrow.length ? narrow : lines)) {
+    for (let x = Math.max(0, Math.floor(l.x0)); x <= Math.min(cover.length - 1, Math.floor(l.x1) + 1); x++) cover[x]++;
   }
+  const nonzero = cover.filter(c => c > 0).sort((a, b) => a - b);
+  const median = nonzero.length ? nonzero[Math.floor(nonzero.length / 2)] : 0;
+  const thresh = Math.max(2, median * 0.25);          // 典型的な行数の1/4未満しか通らない所は隙間
+  let cols = [];
+  let run = null;
+  for (let x = 0; x < cover.length; x++) {
+    if (cover[x] >= thresh) {
+      if (run && x - run[1] <= 8) run[1] = x;          // 8pt以内の途切れは同じ列
+      else { run = [x, x]; cols.push(run); }
+    } else if (run && x - run[1] > 8) run = null;
+  }
+  cols = cols.filter(c => c[1] - c[0] >= 20);
+  if (!cols.length) cols = [[Math.min(...lines.map(l => l.x0)), Math.max(...lines.map(l => l.x1))]];
+  const baseCols = cols;
+  const hitsIn = (l, cs) => cs.map((c, i) => (Math.min(l.x1, c[1]) - Math.max(l.x0, c[0]) > 0) ? i : -1).filter(i => i >= 0);
+  // 列に重なる行は、重なる列のうち一番左へ(2列にまたがる帯見出しは左列の位置に入り読み順が保たれる)
+  const colOfBase = l => { const h = hitsIn(l, baseCols); return h.length ? h[0] : -1; };
+  // どの列にも重ならない行でも、「同じ高さにある列内の行の行末(または行頭)から8pt以内」に続く断片は
+  // その行の列へ取り込む(Word製PDFで行末が切り離される断片対策)。離れた欄外メモは取り込まない。
+  const inCol = lines.map(l => [l, colOfBase(l)]).filter(([, i]) => i >= 0);
   const colOf = l => {
-    const cx = (l.x0 + l.x1) / 2;
-    let i = cols.findIndex(([a, b]) => cx >= a - 2 && cx <= b + 2);
-    if (i < 0) i = cols.findIndex(([a, b]) => l.x0 <= b);   // 幅広の行は左端が属する列へ
-    return i < 0 ? 0 : i;
+    const i = colOfBase(l);
+    if (i >= 0) return i;
+    for (const [m, k] of inCol) {
+      const sameRow = Math.abs(l.y0 - m.y0) < (m.y1 - m.y0) * 0.5;
+      const gap = Math.min(Math.abs(l.x0 - m.x1), Math.abs(m.x0 - l.x1));
+      if (sameRow && gap <= 12) return k;
+    }
+    return -1;
+  };
+  // どの列にも属さない行(欄外の小さな注記など)は、x範囲が重なるもの同士で独立した小さな列にまとめる
+  const stray = lines.filter(l => colOf(l) < 0);
+  const extra = [];
+  for (const l of [...stray].sort((a, b) => a.x0 - b.x0)) {
+    if (extra.length && l.x0 <= extra[extra.length - 1][1] + 2) extra[extra.length - 1][1] = Math.max(extra[extra.length - 1][1], l.x1);
+    else extra.push([l.x0, l.x1]);
+  }
+  const baseN = cols.length;
+  cols = cols.concat(extra);
+  const strayIds = new Set(stray);
+  const colOf2 = l => {
+    if (!strayIds.has(l)) return colOf(l);
+    let best = 0, bestOv = -Infinity;
+    for (let i = baseN; i < cols.length; i++) { const ov = Math.min(l.x1, cols[i][1]) - Math.max(l.x0, cols[i][0]); if (ov > bestOv) { bestOv = ov; best = i; } }
+    return best;
   };
   const groups = cols.map(() => []);
-  for (const l of lines) groups[colOf(l)].push(l);
-  const mainW = Math.max(...cols.map(([a, b]) => b - a));
+  for (const l of lines) groups[colOf2(l)].push(l);
+  const mainW = Math.max(...cols.slice(0, baseN).map(([a, b]) => b - a));
 
+  // 列に属さない小列は、本文より上にあれば先頭、そうでなければ末尾に置く
+  const topY = Math.min(...lines.map(l => l.y0));
+  const order = cols.map((_, i) => i).sort((i, j) => {
+    const key = k => k < baseN ? [1, cols[k][0]] : [(groups[k].length && Math.min(...groups[k].map(l => l.y0)) <= topY + 5) ? 0 : 2, cols[k][0]];
+    const a = key(i), b = key(j); return a[0] - b[0] || a[1] - b[1];
+  });
   const parts = [];
-  cols.forEach(([cx0, cx1], ci) => {
+  for (const ci of order) {
+    const [cx0, cx1] = cols[ci];
     // 同じ高さにある断片は1行にまとめる
     const rows = [];
     for (const l of groups[ci].sort((a, b) => Math.round(a.y0) - Math.round(b.y0) || a.x0 - b.x0)) {
@@ -3656,10 +3725,10 @@ function layoutFromLines(rawLines, pageWidth) {
       prevShort = (r.x1 - r.x0) < colw * 0.6 && !SENT_END_RE.test(r.text);   // 列幅より明らかに短く文末でない = 単独行
     }
     let text = out.join('\n').trim();
-    if (!text) return;
+    if (!text) continue;
     if (cols.length > 1 && (cx1 - cx0) < mainW * 0.4) text = '【欄外メモ】\n' + text;   // 細い列 = 本文脇の注記
     parts.push(text);
-  });
+  }
   return parts.join('\n\n');
 }
 
